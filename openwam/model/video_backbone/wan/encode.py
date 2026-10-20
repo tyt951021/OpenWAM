@@ -43,6 +43,10 @@ def encode_text_for_inference(
     if prompt_embed_cache is not None and prompt in prompt_embed_cache:
         return prompt_embed_cache[prompt]
     context, seq_lens = encode_text([prompt], tokenizer=tokenizer, text_encoder=text_encoder, device=device)
+    # The cache lives for the whole run. Keep the embedding only; a live
+    # autograd graph here retains every text-encoder activation.
+    context = context.detach()
+    seq_lens = seq_lens.detach()
     if prompt_embed_cache is not None:
         prompt_embed_cache[prompt] = (context, seq_lens)
     return context, seq_lens
