@@ -14,11 +14,13 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 from PIL import Image
 
 from openwam.dataloader.bases import BaseDataset
+from openwam.dataloader.demospeedup import build_keep_plan
 from openwam.dataloader.transforms.multiview import assemble_multiview_layout
 from openwam.dataloader.utils import get_cfg
 from openwam.dataloader.utils.normalization import apply_normalization
@@ -71,6 +73,14 @@ class LinglongDataset(BaseDataset):
             normalization_dataset_dir=get_cfg(config, "normalization_dataset_dir", None),
             active_raw_action_dims=get_cfg(config, "active_raw_action_dims", None),
             active_raw_state_dims=get_cfg(config, "active_raw_state_dims", None),
+            demospeedup_enabled=bool(get_cfg(config, "demospeedup_enabled", False)),
+            demospeedup_entropy_dir=get_cfg(config, "demospeedup_entropy_dir", None),
+            demospeedup_r_precision=int(get_cfg(config, "demospeedup_r_precision", 2)),
+            demospeedup_r_casual=int(get_cfg(config, "demospeedup_r_casual", 3)),
+            demospeedup_num_offsets=get_cfg(config, "demospeedup_num_offsets", None),
+            demospeedup_gripper_radius=int(get_cfg(config, "demospeedup_gripper_radius", 3)),
+            demospeedup_gripper_delta=float(get_cfg(config, "demospeedup_gripper_delta", 0.25)),
+            demospeedup_smooth_width=int(get_cfg(config, "demospeedup_smooth_width", 9)),
         )
 
     def __init__(
@@ -98,6 +108,14 @@ class LinglongDataset(BaseDataset):
         normalization_dataset_dir=None,
         active_raw_action_dims=None,
         active_raw_state_dims=None,
+        demospeedup_enabled: bool = False,
+        demospeedup_entropy_dir: str | None = None,
+        demospeedup_r_precision: int = 2,
+        demospeedup_r_casual: int = 3,
+        demospeedup_num_offsets: int | None = None,
+        demospeedup_gripper_radius: int = 3,
+        demospeedup_gripper_delta: float = 0.25,
+        demospeedup_smooth_width: int = 9,
     ):
         self.dataset_dir = self._resolve_dataset_dir(dataset_dir)
         self.split = str(split)
@@ -191,11 +209,64 @@ class LinglongDataset(BaseDataset):
             for i in range(len(self._episodes))
         ]
         self._windows = []
-        for local, episode in enumerate(self._episodes):
-            length = int(episode["length"])
-            max_start = length - self.num_frames if self.split in ("val", "test") else length - self.num_frames
-            if max_start >= 0:
-                self._windows.extend((local, start) for start in range(0, max_start + 1, self.window_stride))
+        self._kept = None
+        self.demospeedup_summary = None
+        use_demospeedup = bool(demospeedup_enabled) and self.split == "train"
+        if use_demospeedup:
+            if not demospeedup_entropy_dir:
+                raise ValueError("demospeedup_entropy_dir is required when demospeedup_enabled is true")
+            for local, episode in enumerate(self._episodes):
+                if int(episode["episode_index"]) != local:
+                    raise ValueError(
+                        "DemoSpeedup expects episodes.jsonl to be ordered by episode_index, "
+                        f"but row {local} has episode_index={episode['episode_index']}"
+                    )
+            plan = build_keep_plan(
+                self._episodes,
+                self._tables,
+                Path(demospeedup_entropy_dir),
+                r_precision=int(demospeedup_r_precision),
+                r_casual=int(demospeedup_r_casual),
+                num_offsets=None if demospeedup_num_offsets is None else int(demospeedup_num_offsets),
+                gripper_radius=int(demospeedup_gripper_radius),
+                gripper_delta=float(demospeedup_gripper_delta),
+                smooth_width=int(demospeedup_smooth_width),
+                min_frames=self.num_frames,
+            )
+            self._kept = plan.tables
+            source_windows = 0
+            for local, episode in enumerate(self._episodes):
+                length = int(episode["length"])
+                if length >= self.num_frames:
+                    source_windows += (length - self.num_frames) // self.window_stride + 1
+                for offset, kept in enumerate(plan.tables[local]):
+                    max_start = len(kept) - self.num_frames
+                    if max_start >= 0:
+                        self._windows.extend(
+                            (local, start, offset) for start in range(0, max_start + 1, self.window_stride)
+                        )
+            summary = dict(plan.summary)
+            summary["windows"] = len(self._windows)
+            summary["source_windows"] = source_windows
+            self.demospeedup_summary = summary
+            if os.environ.get("LOCAL_RANK", "0") in ("0", ""):
+                print(
+                    "[demospeedup] "
+                    f"windows={summary['windows']} source_windows={source_windows} "
+                    f"keep_ratio={summary['mean_keep_ratio']:.4f} "
+                    f"dropped_phases={summary['dropped_phases']}/{summary['phases']} "
+                    f"precision_frames={summary['precision_frames']}/{summary['source_frames']} "
+                    f"threshold={summary['threshold']:.6f} "
+                    f"offsets={summary['num_offsets']} r_precision={summary['r_precision']} "
+                    f"r_casual={summary['r_casual']}",
+                    flush=True,
+                )
+        else:
+            for local, episode in enumerate(self._episodes):
+                length = int(episode["length"])
+                max_start = length - self.num_frames
+                if max_start >= 0:
+                    self._windows.extend((local, start) for start in range(0, max_start + 1, self.window_stride))
         if not self._windows:
             raise ValueError(f"Linglong split={self.split!r} contains no full {self.num_frames}-frame windows")
         self._base_num_windows = len(self._windows)
@@ -405,9 +476,20 @@ class LinglongDataset(BaseDataset):
         with Image.open(path) as image:
             return image.convert("RGB")
 
+    def _window_frames(self, index: int) -> tuple[int, int, np.ndarray]:
+        window = self._windows[index]
+        local = int(window[0])
+        if self._kept is None:
+            start = int(window[1])
+            return local, start, np.arange(start, start + self.num_frames, dtype=np.int64)
+        start_on_kept = int(window[1])
+        kept = self._kept[local][int(window[2])]
+        frames = np.asarray(kept[start_on_kept : start_on_kept + self.num_frames], dtype=np.int64)
+        return local, int(frames[0]), frames
+
     def __getitem__(self, index: int) -> dict:
-        local, start = self._windows[index]
-        table = self._read_table(local).slice(start, self.num_frames)
+        local, start, source_frames = self._window_frames(index)
+        table = self._read_table(local).take(pa.array(source_frames))
         state = np.asarray(table[self.state_key].to_pylist(), dtype=np.float32)
         action = np.asarray(table[self.action_key].to_pylist(), dtype=np.float32)
         if state.shape != (self.num_frames, self.raw_state_dim) or action.shape != (self.num_frames, self.raw_action_dim):

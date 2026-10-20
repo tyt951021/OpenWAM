@@ -1,0 +1,23 @@
+# Online DemoSpeedup on the fittings EEF bucket.
+# Windows are gathered from keep-tables at read time. The parquet bucket and
+# its min-max statistics stay the original ones. Test/val stay contiguous.
+defaults:
+  - train_linglong_0923_1010_1012_1017_fittings_eef_gtstate_8gpu
+  - _self_
+
+dataloader:
+  demospeedup_enabled: true
+  demospeedup_entropy_dir: /vePFS/zhuoyu/OpenWAM/outputs/action_entropy_fittings_eef_step18185_stride2
+  demospeedup_r_precision: 2
+  demospeedup_r_casual: 3
+  demospeedup_num_offsets: null
+  demospeedup_gripper_radius: 3
+  demospeedup_gripper_delta: 0.25
+  demospeedup_smooth_width: 9
+
+training:
+  finetune_ckpt_path: /vePFS/tangyuting/OpenWAM/outputs/linglong_0923_1010_1012_1017_fittings_eef_gtstate_8gpu_bs4_official_finetune/2026-10-19_15-10-08/checkpoint_step_18185.safetensors
+  output_path: /vePFS/zhuoyu/OpenWAM/outputs/linglong_fittings_eef_gtstate_demospeedup_8gpu
+
+project:
+  output_dir: /vePFS/zhuoyu/OpenWAM/outputs/linglong_fittings_eef_gtstate_demospeedup_8gpu/hydra
