@@ -388,15 +388,15 @@ def compute_resume_position(global_step: int, batches_per_epoch: int, grad_accum
 # --- Retention / finalize (prune) ---
 
 
-def manage_checkpoints(output_dir: str, keep_last_k: int):
-    """Keep only the most recent *keep_last_k* checkpoints.
+def manage_checkpoints(output_dir: str, keep_last_k: int, keep_last_state: int | None = None):
+    """Keep only the most recent checkpoints.
 
-    Prunes ``checkpoint_step_*`` (weights, files) and ``accel_state_step_*``
-    (resume state, dirs) in lockstep so a kept weights file always retains its
-    sibling state dir.
+    Prunes ``checkpoint_step_*`` weights to *keep_last_k* and ``accel_state_step_*``
+    resume dirs to *keep_last_state* (the same window, when that argument is omitted).
     """
     import shutil
 
+    state_keep = keep_last_k if keep_last_state is None else keep_last_state
     files = _glob.glob(os.path.join(output_dir, "checkpoint_step_*"))
     files = [p for p in files if os.path.isfile(p) and p.endswith(".safetensors")]
     files.sort(key=lambda p: step_num(p, "checkpoint_step_"))
@@ -420,7 +420,7 @@ def manage_checkpoints(output_dir: str, keep_last_k: int):
             logger.warning("Failed to remove incomplete accelerate state dir %s: %s", old, e)
         state_dirs.remove(old)
     state_dirs.sort(key=lambda p: step_num(p, "accel_state_step_"))
-    while len(state_dirs) > keep_last_k:
+    while len(state_dirs) > state_keep:
         old = state_dirs.pop(0)
         try:
             shutil.rmtree(old)

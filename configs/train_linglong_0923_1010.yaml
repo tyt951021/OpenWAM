@@ -148,7 +148,7 @@ training:
   output_path: /vePFS/tangyuting/OpenWAM/outputs/linglong_0923_1010_32gpu_official_finetune
   save_steps: 200
   save_full_states_for_resume: true
-  keep_last_k_ckpts: 3
+  keep_last_k_ckpts: 2
   # Snapshot onto local memory, then copy to vePFS in the background.
   # Needs about 200 GiB free RAM; otherwise that save falls back to a blocking write.
   async_checkpoints: true

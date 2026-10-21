@@ -1,0 +1,16 @@
+---
+description: 按论文或既有配方实现时，先分开对照官方流程，再写训练配置
+alwaysApply: true
+---
+
+# 对齐官方实现
+
+复现论文、开源配方，或在已有实验上加一个方法时，先写出官方流程，再写本次要落地的流程。两处不一样就明确说出来，等确认后再改配置或脚本。不要把差别写进方案里当成默认做法。
+
+分阶段的方法要分开用产物：
+
+- 只用于打标签、估熵、筛选数据的模型，不能自动当成下一步训练的初始权重。
+- 正式训练的初始化跟该任务的基线一致。Linglong 的新训练从 Foundation 开始，配置字段仍是 `training.finetune_ckpt_path`，指向 `OpenWAM-Alpha-Pretrain-Foundation-Model`。
+- 只有用户明确要求接着某个任务模型训，或者官方流程写明要续训时，才用 `finetune_ckpt_path` 指向那份任务权重，或用 `resume_ckpt_path` 续同一次运行。
+
+DemoSpeedup 的对照：估熵用已经训好的 fittings 模型；正式策略按 fittings 基线从 Foundation 重训，数据换成抽帧后的窗口。

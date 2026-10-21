@@ -1,0 +1,16 @@
+# DemoSpeedup precision stride 1, casual stride 2, four epochs.
+# Foundation initialization, same as the stride 2/3 run. Epochs stay at 4.
+defaults:
+  - train_linglong_0923_1010_1012_1017_fittings_eef_gtstate_demospeedup_foundation_8gpu
+  - _self_
+
+dataloader:
+  demospeedup_r_precision: 1
+  demospeedup_r_casual: 2
+
+training:
+  num_epochs: 4
+  output_path: /vePFS/zhuoyu/OpenWAM/outputs/linglong_fittings_eef_gtstate_demospeedup_r1r2_foundation_8gpu
+
+project:
+  output_dir: /vePFS/zhuoyu/OpenWAM/outputs/linglong_fittings_eef_gtstate_demospeedup_r1r2_foundation_8gpu/hydra

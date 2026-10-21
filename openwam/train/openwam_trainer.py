@@ -729,6 +729,8 @@ class OpenWAMTrainer:
             include_full = False
         if final and not save_full_state:
             prune = "weights_only"
+        elif final:
+            prune = "final"
         else:
             prune = "rolling"
         self._ckpt_publisher.publish(

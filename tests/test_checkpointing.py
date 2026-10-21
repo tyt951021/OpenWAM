@@ -128,6 +128,17 @@ def test_manage_checkpoints_drops_incomplete_state_dirs(tmp_path):
     assert (tmp_path / "checkpoint_step_100.safetensors").is_file()
 
 
+def test_manage_checkpoints_final_keeps_two_weights_and_one_state(tmp_path):
+    for s in (100, 200, 300):
+        (tmp_path / f"checkpoint_step_{s}.safetensors").write_text("x")
+        _make_accel_state(tmp_path, s, marker=True)
+    manage_checkpoints(str(tmp_path), keep_last_k=2, keep_last_state=1)
+    weights = sorted(p.name for p in tmp_path.glob("checkpoint_step_*"))
+    states = sorted(p.name for p in tmp_path.glob("accel_state_step_*"))
+    assert weights == ["checkpoint_step_200.safetensors", "checkpoint_step_300.safetensors"]
+    assert states == ["accel_state_step_300"]
+
+
 def test_manage_checkpoints_prunes_accel_state_in_lockstep(tmp_path):
     for s in (100, 200, 300):
         (tmp_path / f"checkpoint_step_{s}.safetensors").write_text("x")

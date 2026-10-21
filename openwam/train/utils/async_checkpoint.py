@@ -385,5 +385,8 @@ class CheckpointPublisher:
     def _prune(output_path: str, prune: str, keep_last_k: int) -> None:
         if prune == "weights_only":
             finalize_keep_weights_only(output_path, keep_last_k)
+        elif prune == "final":
+            # Finished run: keep the recent weight files, and only the newest resume state.
+            manage_checkpoints(output_path, keep_last_k, keep_last_state=1)
         else:
             manage_checkpoints(output_path, keep_last_k)
