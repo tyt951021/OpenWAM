@@ -201,6 +201,26 @@ def verify_resume_normalization_stats(output_dir: str, dataset) -> None:
 # --- Checkpoint I/O (read/write training state) ---
 
 
+def weights_path(output_path: str, global_step: int) -> str:
+    return os.path.join(output_path, f"checkpoint_step_{global_step}.safetensors")
+
+
+def write_weights_atomic(architecture, output_path: str, global_step: int, state_dict) -> str:
+    """Write weights to a side directory, then rename into the final filename.
+
+    The final name is what ``find_latest_weights`` selects, so a crashed write
+    must not leave a short file under that name. The side directory is hidden
+    from ``manage_checkpoints``.
+    """
+    partial_dir = os.path.join(output_path, ".ckpt_partial")
+    os.makedirs(partial_dir, exist_ok=True)
+    partial = os.path.join(partial_dir, f"checkpoint_step_{global_step}.safetensors")
+    final_path = weights_path(output_path, global_step)
+    architecture.save_checkpoint(partial, state_dict=state_dict)
+    os.replace(partial, final_path)
+    return final_path
+
+
 def save_weights(accelerator, architecture, output_path: str, global_step: int, *, final: bool) -> None:
     """Write the weights safetensors (the deploy artifact).
 
@@ -215,12 +235,12 @@ def save_weights(accelerator, architecture, output_path: str, global_step: int, 
 
     if not accelerator.is_main_process:
         return
-    ckpt_path = os.path.join(output_path, f"checkpoint_step_{global_step}.safetensors")
+    ckpt_path = weights_path(output_path, global_step)
     msg = f"[checkpoint] Saving {'final ' if final else ''}step {global_step} -> {ckpt_path}"
     logger.info(msg)
     tqdm.write(msg)
     state_dict = accelerator.get_state_dict(architecture)
-    accelerator.unwrap_model(architecture).save_checkpoint(ckpt_path, state_dict=state_dict)
+    write_weights_atomic(accelerator.unwrap_model(architecture), output_path, global_step, state_dict)
     msg = f"[checkpoint] Saved{' final' if final else ''}: {ckpt_path}"
     logger.info(msg)
     tqdm.write(msg)
@@ -235,8 +255,6 @@ def save_full_state(
     ``trainer_state.json`` marker last (atomic) so a half-written dir is never picked
     by ``find_latest_accel_state``.
     """
-    import json
-
     state_dir = os.path.join(output_path, f"accel_state_step_{global_step}")
     if accelerator.is_main_process:
         os.makedirs(state_dir, exist_ok=True)
@@ -248,15 +266,30 @@ def save_full_state(
     accelerator.save_state(state_dir)
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        meta = {"global_step": int(global_step), "opt_step": int(opt_step), "epoch": int(epoch)}
-        if resume_context is not None:
-            meta["resume_context"] = resume_context
-        meta_path = os.path.join(state_dir, "trainer_state.json")
-        tmp_path = meta_path + ".tmp"
-        with open(tmp_path, "w") as f:
-            json.dump(meta, f)
-        os.replace(tmp_path, meta_path)
+        write_trainer_state(
+            state_dir, global_step=global_step, opt_step=opt_step, epoch=epoch, resume_context=resume_context
+        )
     accelerator.wait_for_everyone()
+
+
+def write_trainer_state(state_dir: str, *, global_step: int, opt_step: int, epoch: int, resume_context=None) -> None:
+    """Atomically publish the completion marker for ``state_dir``.
+
+    ``find_latest_accel_state`` treats this file as proof that the sharded
+    state finished writing. Callers that copy the state elsewhere must write
+    the marker only after that copy finishes.
+    """
+    import json
+
+    os.makedirs(state_dir, exist_ok=True)
+    meta = {"global_step": int(global_step), "opt_step": int(opt_step), "epoch": int(epoch)}
+    if resume_context is not None:
+        meta["resume_context"] = resume_context
+    meta_path = os.path.join(state_dir, "trainer_state.json")
+    tmp_path = meta_path + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(meta, f)
+    os.replace(tmp_path, meta_path)
 
 
 def load_full_state(accelerator, state_dir: str) -> dict:
@@ -365,6 +398,7 @@ def manage_checkpoints(output_dir: str, keep_last_k: int):
     import shutil
 
     files = _glob.glob(os.path.join(output_dir, "checkpoint_step_*"))
+    files = [p for p in files if os.path.isfile(p) and p.endswith(".safetensors")]
     files.sort(key=lambda p: step_num(p, "checkpoint_step_"))
     while len(files) > keep_last_k:
         old = files.pop(0)
@@ -373,6 +407,18 @@ def manage_checkpoints(output_dir: str, keep_last_k: int):
             logger.info("Removed old checkpoint: %s", old)
 
     state_dirs = [p for p in _glob.glob(os.path.join(output_dir, "accel_state_step_*")) if os.path.isdir(p)]
+    for old in list(state_dirs):
+        if os.path.isfile(os.path.join(old, "trainer_state.json")):
+            continue
+        # A dir without the completion marker is a crashed or in-progress write.
+        # Retention only runs after the newest marker is published, so this is
+        # never the copy that is still being written.
+        try:
+            shutil.rmtree(old)
+            logger.info("Removed incomplete accelerate state dir: %s", old)
+        except OSError as e:
+            logger.warning("Failed to remove incomplete accelerate state dir %s: %s", old, e)
+        state_dirs.remove(old)
     state_dirs.sort(key=lambda p: step_num(p, "accel_state_step_"))
     while len(state_dirs) > keep_last_k:
         old = state_dirs.pop(0)

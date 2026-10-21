@@ -29,16 +29,13 @@ import os
 import torch
 from omegaconf import DictConfig
 
+from openwam.train.utils.async_checkpoint import CheckpointPublisher
 from openwam.train.utils.checkpointing import (
     compute_resume_position,
-    finalize_keep_weights_only,
     find_latest_accel_state,
     load_full_state,
-    manage_checkpoints,
     save_config,
-    save_full_state,
     save_normalization_stats,
-    save_weights,
     verify_resume_normalization_stats,
 )
 from openwam.train.utils.optimizer_groups import build_trainable_parameters
@@ -246,6 +243,11 @@ class OpenWAMTrainer:
             "sampler_order": "epoch_seed_v1",
         }
         self._last_full_state_step = None
+        self._ckpt_publisher = CheckpointPublisher(
+            self.accelerator,
+            enabled=bool(getattr(t, "async_checkpoints", False)),
+            staging_root=cfg_get(t, "checkpoint_staging_dir", None) or None,
+        )
 
         if self._run_seed is not None:
             from openwam.dataloader.mixture import MixtureDataset
@@ -315,97 +317,100 @@ class OpenWAMTrainer:
         # Gated on _run_seed so unseeded production runs stay fully stochastic.
         epochs = itertools.count(start_epoch) if num_epochs is None else range(start_epoch, num_epochs)
         last_save_step = global_step
-        for epoch in epochs:
-            if hasattr(dataloader, "set_epoch"):
-                dataloader.set_epoch(epoch)
-            if hasattr(self.dataset, "set_epoch"):
-                self.dataset.set_epoch(epoch)
-            # On the resumed epoch, skip the batches already consumed before the checkpoint.
-            if epoch == start_epoch and skip_first > 0:
-                from accelerate import skip_first_batches
+        try:
+            for epoch in epochs:
+                if hasattr(dataloader, "set_epoch"):
+                    dataloader.set_epoch(epoch)
+                if hasattr(self.dataset, "set_epoch"):
+                    self.dataset.set_epoch(epoch)
+                # On the resumed epoch, skip the batches already consumed before the checkpoint.
+                if epoch == start_epoch and skip_first > 0:
+                    from accelerate import skip_first_batches
 
-                epoch_iter = skip_first_batches(dataloader, skip_first)
-                # skip_first_batches creates a fresh wrapper with iteration=0.
-                # Its __iter__ would otherwise reset the sampler to epoch zero.
-                if hasattr(epoch_iter, "set_epoch"):
-                    epoch_iter.set_epoch(epoch)
-            else:
-                epoch_iter = dataloader
-            for batch in epoch_iter:
-                if self._run_seed is not None:
-                    step_seed = per_step_seed(self._run_seed, rank=self._rank, step=global_step)
-                    torch.manual_seed(step_seed)
-                    if torch.cuda.is_available():
-                        torch.cuda.manual_seed_all(step_seed)
-                with self.accelerator.accumulate(self.architecture):
-                    losses = self.compute_loss(batch)
-                    loss = losses["total"]
-                    self.accelerator.backward(loss)
+                    epoch_iter = skip_first_batches(dataloader, skip_first)
+                    # skip_first_batches creates a fresh wrapper with iteration=0.
+                    # Its __iter__ would otherwise reset the sampler to epoch zero.
+                    if hasattr(epoch_iter, "set_epoch"):
+                        epoch_iter.set_epoch(epoch)
+                else:
+                    epoch_iter = dataloader
+                for batch in epoch_iter:
+                    if self._run_seed is not None:
+                        step_seed = per_step_seed(self._run_seed, rank=self._rank, step=global_step)
+                        torch.manual_seed(step_seed)
+                        if torch.cuda.is_available():
+                            torch.cuda.manual_seed_all(step_seed)
+                    with self.accelerator.accumulate(self.architecture):
+                        losses = self.compute_loss(batch)
+                        loss = losses["total"]
+                        self.accelerator.backward(loss)
 
-                    grad_norm = torch.tensor(0.0, device=loss.device)
-                    if self.accelerator.sync_gradients:
-                        if max_grad_norm is not None:
-                            grad_norm_val = self.accelerator.clip_grad_norm_(all_params, max_grad_norm)
-                            grad_norm = torch.tensor(float(grad_norm_val), device=loss.device)
-                        optimizer.step()
-                        if scheduler is not None:
-                            scheduler.step()
-                        optimizer.zero_grad()
-                        opt_step += 1
+                        grad_norm = torch.tensor(0.0, device=loss.device)
+                        if self.accelerator.sync_gradients:
+                            if max_grad_norm is not None:
+                                grad_norm_val = self.accelerator.clip_grad_norm_(all_params, max_grad_norm)
+                                grad_norm = torch.tensor(float(grad_norm_val), device=loss.device)
+                            optimizer.step()
+                            if scheduler is not None:
+                                scheduler.step()
+                            optimizer.zero_grad()
+                            opt_step += 1
 
-                global_step += 1
+                    global_step += 1
 
-                metrics = reduce_step_metrics(self.accelerator, losses, grad_norm)
+                    metrics = reduce_step_metrics(self.accelerator, losses, grad_norm)
 
-                current_lr = optimizer.param_groups[0]["lr"]
-                _now = _time.monotonic()
-                steps_per_sec = 1.0 / max(_now - _step_t0, 1e-9)
-                _step_t0 = _now
+                    current_lr = optimizer.param_groups[0]["lr"]
+                    _now = _time.monotonic()
+                    steps_per_sec = 1.0 / max(_now - _step_t0, 1e-9)
+                    _step_t0 = _now
 
-                self.log_step(
-                    metrics=metrics,
-                    global_step=global_step,
-                    opt_step=opt_step,
-                    epoch=epoch,
-                    lr=current_lr,
-                    steps_per_sec=steps_per_sec,
-                    batch_size=batch_size,
-                    pbar=pbar,
-                    wandb_run=wandb_run,
-                    debug=debug,
-                    output_path=output_path,
-                )
-
-                # Full state does not include partially accumulated gradients. Defer
-                # each due checkpoint until the next completed optimizer update.
-                save_due = bool(save_steps) and global_step // save_steps > last_save_step // save_steps
-                at_boundary = self.accelerator.sync_gradients
-                if save_due and (not save_full_states_for_resume or at_boundary):
-                    save_weights(self.accelerator, self.architecture, output_path, global_step, final=False)
-                    if save_full_states_for_resume:
-                        self.save_resumable_state(output_path, global_step, opt_step, epoch)
-                    if is_main:
-                        manage_checkpoints(output_path, keep_last_k)
-                    self.accelerator.wait_for_everyone()
-                    last_save_step = global_step
-
-                if max_steps and global_step >= max_steps:
-                    if save_steps and save_full_states_for_resume and not at_boundary:
-                        if global_step == max_steps:
-                            logger.info("max_steps reached; finishing the current gradient accumulation before saving.")
-                        continue
-                    pbar.close()
-                    self.finish_training(
-                        output_path, global_step, save_steps, keep_last_k, is_main, wandb_run,
-                        opt_step=opt_step, epoch=epoch,
+                    self.log_step(
+                        metrics=metrics,
+                        global_step=global_step,
+                        opt_step=opt_step,
+                        epoch=epoch,
+                        lr=current_lr,
+                        steps_per_sec=steps_per_sec,
+                        batch_size=batch_size,
+                        pbar=pbar,
+                        wandb_run=wandb_run,
+                        debug=debug,
+                        output_path=output_path,
                     )
-                    return
 
-        pbar.close()
-        self.finish_training(
-            output_path, global_step, save_steps, keep_last_k, is_main, wandb_run,
-            opt_step=opt_step, epoch=epoch,
-        )
+                    # Full state does not include partially accumulated gradients. Defer
+                    # each due checkpoint until the next completed optimizer update.
+                    self._ckpt_publisher.raise_if_async_failed()
+                    save_due = bool(save_steps) and global_step // save_steps > last_save_step // save_steps
+                    at_boundary = self.accelerator.sync_gradients
+                    if save_due and (not save_full_states_for_resume or at_boundary):
+                        self.publish_checkpoint(
+                            output_path, global_step, opt_step, epoch,
+                            final=False, keep_last_k=keep_last_k,
+                            save_full_state=save_full_states_for_resume,
+                        )
+                        last_save_step = global_step
+
+                    if max_steps and global_step >= max_steps:
+                        if save_steps and save_full_states_for_resume and not at_boundary:
+                            if global_step == max_steps:
+                                logger.info("max_steps reached; finishing the current gradient accumulation before saving.")
+                            continue
+                        pbar.close()
+                        self.finish_training(
+                            output_path, global_step, save_steps, keep_last_k, is_main, wandb_run,
+                            opt_step=opt_step, epoch=epoch,
+                        )
+                        return
+
+            pbar.close()
+            self.finish_training(
+                output_path, global_step, save_steps, keep_last_k, is_main, wandb_run,
+                opt_step=opt_step, epoch=epoch,
+            )
+        finally:
+            self._ckpt_publisher.close()
 
     # (3) Called by train() first — AdamW over the per-module (action/video) LR param groups.
     def build_optimizer(self) -> torch.optim.Optimizer:
@@ -710,16 +715,29 @@ class OpenWAMTrainer:
                 steps_per_sec=steps_per_sec,
             )
 
-    def save_resumable_state(self, output_path, global_step, opt_step, epoch):
-        if not self.accelerator.sync_gradients:
+    def publish_checkpoint(
+        self, output_path, global_step, opt_step, epoch, *, final: bool, keep_last_k: int, save_full_state: bool,
+    ):
+        """Save weights and, at an optimizer boundary, the resumable state.
+
+        When async saves are on, the filesystem copy continues after this returns.
+        """
+        include_full = bool(save_full_state)
+        if include_full and not self.accelerator.sync_gradients:
             raise RuntimeError("Cannot save full state with partially accumulated gradients")
-        if self._last_full_state_step == global_step:
-            return
-        save_full_state(
-            self.accelerator, output_path, global_step, opt_step, epoch,
-            resume_context=self._resume_context,
+        if include_full and self._last_full_state_step == global_step:
+            include_full = False
+        if final and not save_full_state:
+            prune = "weights_only"
+        else:
+            prune = "rolling"
+        self._ckpt_publisher.publish(
+            self.architecture, output_path, global_step, opt_step, epoch,
+            resume_context=self._resume_context, final=final, include_full_state=include_full,
+            prune=prune, keep_last_k=keep_last_k,
         )
-        self._last_full_state_step = global_step
+        if include_full:
+            self._last_full_state_step = global_step
 
     # (11) Final weights and, when enabled, resumable state; close wandb.
     def finish_training(
@@ -741,15 +759,13 @@ class OpenWAMTrainer:
         """
         full_state = bool(getattr(self.cfg.training, "save_full_states_for_resume", False))
         if save_steps:
-            save_weights(self.accelerator, self.architecture, output_path, global_step, final=True)
-            if full_state:
-                self.save_resumable_state(output_path, global_step, opt_step, epoch)
-        self.accelerator.wait_for_everyone()
-        if is_main and save_steps:
-            if full_state:
-                manage_checkpoints(output_path, keep_last_k)
-            else:
-                finalize_keep_weights_only(output_path, keep_last_k)
+            if full_state and not self.accelerator.sync_gradients:
+                raise RuntimeError("Cannot save full state with partially accumulated gradients")
+            self.publish_checkpoint(
+                output_path, global_step, opt_step, epoch,
+                final=True, keep_last_k=keep_last_k, save_full_state=full_state,
+            )
+            self._ckpt_publisher.wait()
         self.accelerator.wait_for_everyone()
         if wandb_run is not None:
             wandb_run.finish()

@@ -53,6 +53,8 @@ training:
   save_full_states_for_resume: false  # Also save resumable full state (optimizer/scheduler/RNG) at each save;
                                       # required for training.resume_ckpt_path, costs extra disk per checkpoint
   keep_last_k_ckpts: 1           # Rolling window: keep only the last K checkpoints
+  async_checkpoints: false        # Stage the checkpoint locally and copy it in the background
+  checkpoint_staging_dir: null    # Fast local directory for that snapshot; null uses /dev/shm when it has room
 
   # --- Finetune / Resume (mutually exclusive; both point to a training output dir, latest step auto-selected) ---
   finetune_ckpt_path: null   # non-null: warm-start from latest weights in this dir (step from 0, new output dir)

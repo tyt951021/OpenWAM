@@ -118,6 +118,16 @@ def test_finalize_default_keeps_only_final_weight(tmp_path):
 # --- manage_checkpoints: weights + accel_state pruned in lockstep ---
 
 
+def test_manage_checkpoints_drops_incomplete_state_dirs(tmp_path):
+    (tmp_path / "checkpoint_step_100.safetensors").write_text("x")
+    _make_accel_state(tmp_path, 100, marker=True)
+    _make_accel_state(tmp_path, 200, marker=False)
+    manage_checkpoints(str(tmp_path), keep_last_k=3)
+    assert not (tmp_path / "accel_state_step_200").exists()
+    assert (tmp_path / "accel_state_step_100").is_dir()
+    assert (tmp_path / "checkpoint_step_100.safetensors").is_file()
+
+
 def test_manage_checkpoints_prunes_accel_state_in_lockstep(tmp_path):
     for s in (100, 200, 300):
         (tmp_path / f"checkpoint_step_{s}.safetensors").write_text("x")

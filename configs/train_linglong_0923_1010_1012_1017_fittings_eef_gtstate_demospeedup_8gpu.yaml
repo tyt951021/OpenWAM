@@ -16,7 +16,9 @@ dataloader:
   demospeedup_smooth_width: 9
 
 training:
-  finetune_ckpt_path: /vePFS/tangyuting/OpenWAM/outputs/linglong_0923_1010_1012_1017_fittings_eef_gtstate_8gpu_bs4_official_finetune/2026-10-19_15-10-08/checkpoint_step_18185.safetensors
+  save_steps: 2000
+  finetune_ckpt_path: null
+  resume_ckpt_path: /vePFS/zhuoyu/OpenWAM/outputs/linglong_fittings_eef_gtstate_demospeedup_8gpu/2026-10-20_12-05-27
   output_path: /vePFS/zhuoyu/OpenWAM/outputs/linglong_fittings_eef_gtstate_demospeedup_8gpu
 
 project:
