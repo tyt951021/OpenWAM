@@ -107,6 +107,8 @@ class PiperXDataset(BaseDataset):
         self.action_mode = str(action_mode)
         if self.action_mode != "eef_quat":
             raise ValueError(f"Piper X only reads absolute EEF quaternions, got action_mode={self.action_mode!r}")
+        self.state_key = STATE_COLUMN
+        self.action_key = ACTION_COLUMN
         self.num_frames = int(num_frames)
         self.video_stride = int(video_stride)
         self.window_stride = int(window_stride)
@@ -189,6 +191,10 @@ class PiperXDataset(BaseDataset):
                 raise ValueError(f"overfit_episode={self.overfit_episode} has no full window")
             self._windows = episode_windows * self.overfit_repeats
 
+        if normalization_dataset_dir is None and self.split in ("test", "val") and self.dataset_dir.name.endswith("_test_15hz"):
+            normalization_dataset_dir = self.dataset_dir.with_name(
+                self.dataset_dir.name[: -len("_test_15hz")] + "_train_15hz"
+            )
         stats_dir = self.dataset_dir if normalization_dataset_dir is None else Path(normalization_dataset_dir)
         if self.split in ("test", "val"):
             train_manifest = self._read_manifest(stats_dir, "train")
