@@ -1,0 +1,16 @@
+# DemoSpeedup precision stride 1, casual stride 2.
+# Same 900-episode bucket, entropy directory, and Foundation initialization as the stride 2/3 run.
+defaults:
+  - train_linglong_allstuff_20261019_20261020_eef_demospeedup_foundation_8gpu
+  - _self_
+
+dataloader:
+  demospeedup_r_precision: 1
+  demospeedup_r_casual: 2
+
+training:
+  num_epochs: 5
+  output_path: /vePFS/zhuoyu/OpenWAM/outputs/linglong_allstuff_20261019_20261020_eef_demospeedup_r1r2_foundation_8gpu
+
+project:
+  output_dir: /vePFS/zhuoyu/OpenWAM/outputs/linglong_allstuff_20261019_20261020_eef_demospeedup_r1r2_foundation_8gpu/hydra

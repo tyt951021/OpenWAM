@@ -1,0 +1,26 @@
+# DemoSpeedup precision stride 2, casual stride 3, on the 900-episode
+# all-stuff plus sheet bucket. Entropy is the remapped stride-2 directory.
+# The policy is trained from Foundation, same initialization as the all-stuff baseline.
+defaults:
+  - train_linglong_allstuff_20261019_20261020_eef_8gpu
+  - _self_
+
+dataloader:
+  demospeedup_enabled: true
+  demospeedup_entropy_dir: /vePFS/zhuoyu/OpenWAM/outputs/action_entropy_allstuff_20261019_20261020_eef_step18185_stride2
+  demospeedup_r_precision: 2
+  demospeedup_r_casual: 3
+  demospeedup_num_offsets: null
+  demospeedup_gripper_radius: 3
+  demospeedup_gripper_delta: 0.25
+  demospeedup_smooth_width: 9
+
+training:
+  num_epochs: 5
+  save_steps: 2000
+  finetune_ckpt_path: /vePFS/zhuoyu/OpenWAM/assets/openwam_ckpt/openwam_alpha/OpenWAM-Alpha-Pretrain-Foundation-Model
+  resume_ckpt_path: null
+  output_path: /vePFS/zhuoyu/OpenWAM/outputs/linglong_allstuff_20261019_20261020_eef_demospeedup_foundation_8gpu
+
+project:
+  output_dir: /vePFS/zhuoyu/OpenWAM/outputs/linglong_allstuff_20261019_20261020_eef_demospeedup_foundation_8gpu/hydra
