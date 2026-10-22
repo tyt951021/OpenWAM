@@ -1,9 +1,12 @@
 """Offline Linglong train-set inference/evaluation for an OpenWAM checkpoint.
 
 This evaluates observation windows without teacher forcing: only the first
-multiview image, the raw 24-D measured state, and the task prompt are passed to
-the policy.  The generated 80-D unified action trajectory is returned through
-the checkpoint normalizer and compared with the raw 24-D ``q_exp`` targets.
+multiview image, the raw measured state, and the task prompt are passed to the
+policy.  Joint checkpoints use the 24-D ``observation.state`` / ``action``
+columns.  EEF checkpoints use the 16-D ``observation.state_eef`` /
+``action_eef`` columns named by the checkpoint dataloader config.  The
+generated unified action trajectory is returned through the checkpoint
+normalizer and compared with those raw targets.
 """
 
 from __future__ import annotations
@@ -19,6 +22,26 @@ import torch
 from omegaconf import OmegaConf
 
 
+def _closed_loop_proprio(action: np.ndarray, state_key: str) -> np.ndarray:
+    """Hold the last predicted action as the next chunk's measured state.
+
+    The 32-action chunk ends one 15 Hz step before the next video frame, which
+    is the following chunk's first image. EEF wxyz blocks are re-normalized.
+    """
+    proprio = np.array(action[-1], dtype=np.float32, copy=True)
+    if state_key != "observation.state_eef":
+        return proprio
+    if proprio.shape != (16,):
+        raise ValueError(f"EEF closed-loop proprio must be 16-D, got {proprio.shape}")
+    for quat_start in (3, 11):
+        quat = proprio[quat_start:quat_start + 4]
+        norm = float(np.linalg.norm(quat))
+        if norm < 1e-6:
+            raise ValueError("closed-loop EEF quaternion is degenerate")
+        proprio[quat_start:quat_start + 4] = quat / norm
+    return proprio
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint-dir", required=True)
@@ -30,6 +53,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--denoise-steps", type=int, default=10)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--decode-video", action="store_true", help="Decode and save generated Wan video frames.")
+    p.add_argument("--closed-loop", action="store_true",
+                   help="Feed the previous chunk's last generated frame and last predicted action into the next chunk. Implies --decode-video and requires --chunk-stride 32.")
     p.add_argument("--video-output", default=None, help="Directory for generated and GT comparison MP4s.")
     p.add_argument("--output", required=True)
     return p
@@ -37,6 +62,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = _build_parser().parse_args()
+    if args.closed_loop:
+        args.decode_video = True
     repo = Path(__file__).resolve().parents[1]
     import sys
 
@@ -73,6 +100,18 @@ def main() -> None:
         episode_windows = [x for x in episode_windows if x[1] in wanted]
     else:
         episode_windows = episode_windows[: int(args.max_windows)]
+    if args.closed_loop:
+        if args.chunk_stride != ds.num_frames - 1:
+            raise ValueError(
+                f"closed-loop requires --chunk-stride {ds.num_frames - 1} "
+                "so the last generated frame is the next chunk start"
+            )
+        if not episode_windows:
+            raise ValueError(f"episode {args.episode} has no closed-loop windows")
+        got = [start for _, start in episode_windows]
+        expect = list(range(got[0], got[-1] + 1, args.chunk_stride))
+        if got != expect:
+            raise ValueError(f"closed-loop windows are not contiguous: {got[:8]}")
 
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -100,18 +139,27 @@ def main() -> None:
     targets = []
     latencies = []
     starts = []
-    print(f"[eval] windows={len(episode_windows)} denoise_steps={args.denoise_steps}", flush=True)
+    print(
+        f"[eval] windows={len(episode_windows)} denoise_steps={args.denoise_steps} "
+        f"state_key={ds.state_key} action_key={ds.action_key} valid_dims={int(ds.raw_action_mask.sum())} "
+        f"closed_loop={bool(args.closed_loop)}",
+        flush=True,
+    )
+    feedback = None
+    generated_label = "Generated (closed loop)" if args.closed_loop else "Generated (recorded first frame)"
     for i, (local, start) in enumerate(episode_windows, 1):
         sample = ds[ds._windows.index((local, start))]
         table = ds._read_table(local).slice(start, ds.num_frames)
-        raw_state = np.asarray(table["observation.state"][0].as_py(), dtype=np.float32)
-        raw_target = np.asarray(table["action"].to_pylist(), dtype=np.float32)[: ds.num_frames - 1]
+        raw_state = np.asarray(table[ds.state_key][0].as_py(), dtype=np.float32)
+        raw_target = np.asarray(table[ds.action_key].to_pylist(), dtype=np.float32)[: ds.num_frames - 1]
+        first_image = [feedback["image"]] if feedback is not None else sample["first_frame_image"]
+        proprio = feedback["proprio"] if feedback is not None else raw_state
         t0 = time.perf_counter()
         result = engine.generate(
             {
                 "prompt": sample["prompt"],
-                "first_frame_image": sample["first_frame_image"],
-                "proprio": raw_state,
+                "first_frame_image": first_image,
+                "proprio": proprio,
                 "seed": int(args.seed),
                 "denoise_steps": int(args.denoise_steps),
             }
@@ -136,9 +184,9 @@ def main() -> None:
                 draw = ImageDraw.Draw(panel)
                 raw_frame = start + j * ds.video_stride
                 draw.text((8, 5), "GT (recorded)", fill="white")
-                draw.text((w + 8, 5), "Generated (first frame conditioned)", fill="white")
+                draw.text((w + 8, 5), generated_label, fill="white")
                 draw.text((8, 23), f"Episode {args.episode} | chunk {i}/{len(episode_windows)} | start={start} | frame={raw_frame} | t={raw_frame/raw_fps:.3f}s", fill="white")
-                layout = "Non-overlap action chunks" if contiguous else "Window comparison"
+                layout = "Closed-loop image and action" if args.closed_loop else ("Non-overlap action chunks" if contiguous else "Window comparison")
                 draw.text((8, 39), f"{layout} | video {video_fps:g} fps | denoise={args.denoise_steps} | seed={args.seed}", fill="white")
                 comparison.append_data(np.asarray(panel))
                 generated.append_data(np.asarray(frame))
@@ -153,12 +201,19 @@ def main() -> None:
         pred = np.asarray(result["actions"], dtype=np.float32)
         if pred.shape != raw_target.shape:
             raise RuntimeError(f"shape mismatch at window {start}: pred={pred.shape} target={raw_target.shape}")
+        if args.closed_loop:
+            video = result.get("video")
+            if not video or len(video) != len(sample["video"]):
+                raise RuntimeError("closed-loop generated video missing or frame count differs from GT")
+            feedback = {
+                "image": video[-1].convert("RGB"),
+                "proprio": _closed_loop_proprio(pred, ds.state_key),
+            }
         predictions.append(pred)
         targets.append(raw_target)
         latencies.append(latency)
         starts.append(int(start))
-        valid = np.arange(raw_target.shape[-1]) < 22
-        err = np.abs(pred[:, valid] - raw_target[:, valid])
+        err = np.abs(pred[:, ds.raw_action_mask] - raw_target[:, ds.raw_action_mask])
         print(
             f"[eval] {i:03d}/{len(episode_windows)} start={start:03d} "
             f"latency={latency/1000:.2f}s mae={err.mean():.5f} max={err.max():.5f}",
@@ -172,7 +227,12 @@ def main() -> None:
             "checkpoint": str(ckpt), "episode": args.episode, "seed": args.seed,
             "denoise_steps": args.denoise_steps, "raw_fps": raw_fps, "video_fps": video_fps,
             "dit_cache_enabled": bool(deploy_cfg.optimization.dit_cache.enabled),
-            "description": "Each chunk is conditioned on its recorded first image and state. Not an autoregressive rollout. Subsequent GT frames are used for comparison only. Shared boundary frames are removed for contiguous chunks.",
+            "closed_loop": bool(args.closed_loop),
+            "description": (
+                "The first chunk uses the recorded image and state. Each later chunk uses the previous chunk's last generated frame and last predicted action. That action is one 15 Hz step before the video frame. GT frames stay the recording. Shared boundary frames are removed."
+                if args.closed_loop else
+                "Each chunk is conditioned on its recorded first image and state. Not an autoregressive rollout. Subsequent GT frames are used for comparison only. Shared boundary frames are removed for contiguous chunks."
+            ),
             "chunk_stride": args.chunk_stride,
             "episode_frames": int(ds._episodes[args.episode]["length"]),
             "last_covered_raw_frame": int(episode_windows[-1][1] + ds.num_frames - 1),
@@ -182,16 +242,18 @@ def main() -> None:
         print(f"[eval] MP4 files finalized in {video_dir}", flush=True)
     pred = np.stack(predictions)
     target = np.stack(targets)
-    valid = np.arange(target.shape[-1]) < 22
-    err = pred[:, :, valid] - target[:, :, valid]
+    err = pred[:, :, ds.raw_action_mask] - target[:, :, ds.raw_action_mask]
     metrics = {
         "checkpoint_dir": str(ckpt),
         "dataset_dir": str(args.dataset_dir),
         "episode": int(args.episode),
         "windows": int(len(episode_windows)),
         "denoise_steps": int(args.denoise_steps),
+        "state_key": ds.state_key,
+        "action_key": ds.action_key,
+        "closed_loop": bool(args.closed_loop),
         "action_dim": int(pred.shape[-1]),
-        "valid_action_dims": 22,
+        "valid_action_dims": int(ds.raw_action_mask.sum()),
         "mae": float(np.abs(err).mean()),
         "rmse": float(np.sqrt(np.mean(err**2))),
         "max_abs_error": float(np.abs(err).max()),
