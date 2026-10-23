@@ -15,8 +15,10 @@ the Linglong episode holdout and are not copied across splits.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -254,53 +256,66 @@ def _contracts(fk: PiperXKinematics):
     }
 
 
+def _place_image(pair):
+    source, dest = pair
+    try:
+        os.link(source, dest)
+    except OSError:
+        shutil.copyfile(source, dest)
+
+
 def _write_bucket(root: Path, split: str, records, tasks, train_stats, contracts, provenance, reused):
     root.mkdir(parents=True)
     episodes, mapping, offset = [], [], 0
-    for index, record in enumerate(records):
-        image_paths = {}
-        for camera, sources in record["image_sources"].items():
-            relative = []
-            for sample_id, source in zip(record["sample_ids"], sources):
-                dest = root / "images" / f"episode_{index:06d}" / camera / f"{sample_id}.jpg"
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(source, dest)
-                relative.append(dest.relative_to(root).as_posix())
-            image_paths[camera] = relative
-        n = record["frames"]
-        task_index = tasks.index(record["prompt"])
-        values = {
-            "observation.state_eef": _fixed_list(record["state"], EEF_DIM),
-            "action_eef": _fixed_list(record["action"], EEF_DIM),
-            "timestamp": pa.array(np.arange(n, dtype=np.float32) / FPS),
-            "frame_index": pa.array(np.arange(n, dtype=np.int64)),
-            "episode_index": pa.array(np.full(n, index, dtype=np.int64)),
-            "index": pa.array(np.arange(offset, offset + n, dtype=np.int64)),
-            "task_index": pa.array(np.full(n, task_index, dtype=np.int64)),
-            **{f"observation.images.{camera}": pa.array(image_paths[camera]) for camera in image_paths},
-        }
-        path = root / "data" / f"chunk-{index // 1000:03d}" / f"episode_{index:06d}.parquet"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        pq.write_table(pa.table(values), path, compression="zstd")
-        episodes.append({
-            "episode_index": index,
-            "episode_id": record["source_episode"],
-            "length": n,
-            "tasks": [record["prompt"]],
-            "task_index": task_index,
-        })
-        mapping.append({
-            "episode_index": index,
-            "source_id": record["source_id"],
-            "source_episode": record["source_episode"],
-            "segment": record["segment"],
-            "sha256": record["sha256"],
-            "frames": n,
-            "fk_report": record["fk_report"],
-            "gripper_command_origins": record["gripper_command_origins"],
-            "reuse_for_test": record["reuse_for_test"],
-        })
-        offset += n
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        for index, record in enumerate(records):
+            image_paths = {}
+            for camera, sources in record["image_sources"].items():
+                dest_dir = root / "images" / f"episode_{index:06d}" / camera
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                pairs = []
+                relative = []
+                for sample_id, source in zip(record["sample_ids"], sources):
+                    dest = dest_dir / f"{sample_id}.jpg"
+                    pairs.append((source, dest))
+                    relative.append(dest.relative_to(root).as_posix())
+                list(pool.map(_place_image, pairs))
+                image_paths[camera] = relative
+            print(f"linked {split} episode {index}: {record['frames']} frames", flush=True)
+            n = record["frames"]
+            task_index = tasks.index(record["prompt"])
+            values = {
+                "observation.state_eef": _fixed_list(record["state"], EEF_DIM),
+                "action_eef": _fixed_list(record["action"], EEF_DIM),
+                "timestamp": pa.array(np.arange(n, dtype=np.float32) / FPS),
+                "frame_index": pa.array(np.arange(n, dtype=np.int64)),
+                "episode_index": pa.array(np.full(n, index, dtype=np.int64)),
+                "index": pa.array(np.arange(offset, offset + n, dtype=np.int64)),
+                "task_index": pa.array(np.full(n, task_index, dtype=np.int64)),
+                **{f"observation.images.{camera}": pa.array(image_paths[camera]) for camera in image_paths},
+            }
+            path = root / "data" / f"chunk-{index // 1000:03d}" / f"episode_{index:06d}.parquet"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            pq.write_table(pa.table(values), path, compression="zstd")
+            episodes.append({
+                "episode_index": index,
+                "episode_id": record["source_episode"],
+                "length": n,
+                "tasks": [record["prompt"]],
+                "task_index": task_index,
+            })
+            mapping.append({
+                "episode_index": index,
+                "source_id": record["source_id"],
+                "source_episode": record["source_episode"],
+                "segment": record["segment"],
+                "sha256": record["sha256"],
+                "frames": n,
+                "fk_report": record["fk_report"],
+                "gripper_command_origins": record["gripper_command_origins"],
+                "reuse_for_test": record["reuse_for_test"],
+            })
+            offset += n
     _write_jsonl(root / "meta/episodes.jsonl", episodes)
     _write_jsonl(root / "meta/tasks.jsonl", [{"task_index": i, "task": task} for i, task in enumerate(tasks)])
     _write_jsonl(root / "meta/episodes_stats.jsonl", [
@@ -353,6 +368,11 @@ def _write_bucket(root: Path, split: str, records, tasks, train_stats, contracts
     return {"episodes": len(records), "frames": offset, "windows": manifest["total_windows"]}
 
 
+def _build_episode_job(job):
+    segment, prompt, entry = job
+    return build_episode(Path(segment), PiperXKinematics(), prompt, entry)
+
+
 def convert_piper_x(input_path, output_root, *, prompt=None, episode_config=None, test_fraction=0.1, seed=0):
     input_path = Path(input_path).expanduser().resolve(strict=True)
     output_root = Path(output_root).expanduser().resolve()
@@ -363,20 +383,29 @@ def convert_piper_x(input_path, output_root, *, prompt=None, episode_config=None
     config = {} if episode_config is None else episode_config
     if not isinstance(config, dict):
         raise ValueError("episode config must be an object")
-    fk = PiperXKinematics()
     segments = discover_segments(input_path)
-    records = []
+    jobs = []
     used = set()
     for segment in segments:
-        manifest, _rows = _load_segment(segment)
-        key = segment.name if segment.name in config else str(manifest.get("episode", segment.name))
+        if segment.name in config:
+            key = segment.name
+        else:
+            manifest = json.loads((segment / "manifest.json").read_text())
+            key = str(manifest.get("episode", segment.name))
         entry = config.get(key, {})
         if key in config:
             used.add(key)
         if not isinstance(entry, dict):
             raise ValueError(f"episode config entry must be an object: {key}")
-        records.append(build_episode(segment, fk, prompt, entry))
-        print(f"decoded {segment.name}: {records[-1]['frames']} frames", flush=True)
+        jobs.append((str(segment), prompt, entry))
+    records = [None] * len(jobs)
+    workers = min(len(jobs), 32)
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_build_episode_job, job): index for index, job in enumerate(jobs)}
+        for done, future in enumerate(as_completed(futures), 1):
+            index = futures[future]
+            records[index] = future.result()
+            print(f"decoded {done}/{len(jobs)} {records[index]['segment']}: {records[index]['frames']} frames", flush=True)
     if set(config) - used:
         raise ValueError(f"unmatched episode-config keys: {sorted(set(config) - used)}")
     train, test, reused = assign_splits(records, test_fraction, seed)
@@ -406,6 +435,7 @@ def convert_piper_x(input_path, output_root, *, prompt=None, episode_config=None
         },
     }
     tasks = sorted({record["prompt"] for record in records})
+    fk = PiperXKinematics()
     provenance = {
         "raw_input": str(input_path),
         "urdf_sha256": _sha256(fk.urdf_path),

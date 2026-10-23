@@ -1,0 +1,19 @@
+# Official RoboDojo Piper-X pose layout on the same 10-epoch recipe.
+# action_mode eef packs stored wxyz into xyz + rot6d + gripper, 20D per pair,
+# scattered to slots 0-9 and 34-43. Rotation 6D is not normalized per dimension.
+defaults:
+  - train_piper_x_20261022_ax_only_full_eef_8gpu_e10_piperx_pretrain
+  - _self_
+
+dataloader:
+  action_mode: eef
+  unify_action_map: ["0-9", "34-43"]
+  unify_state_map: ["0-9", "34-43"]
+  active_raw_action_dims: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+  active_raw_state_dims: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+
+training:
+  output_path: /vePFS/zhuoyu/OpenWAM/outputs/piper_x_20261022_ax_only_full_eef_8gpu_e10_piperx_pretrain_rot6d
+
+project:
+  output_dir: /vePFS/zhuoyu/OpenWAM/outputs/piper_x_20261022_ax_only_full_eef_8gpu_e10_piperx_pretrain_rot6d/hydra

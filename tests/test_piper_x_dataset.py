@@ -1,9 +1,12 @@
 import json
 from pathlib import Path
 
+import numpy as np
+import pyarrow.parquet as pq
 from hydra import compose, initialize_config_dir
 
-from openwam.dataloader.piper_x import PiperXDataset
+from openwam.dataloader.piper_x import PiperXDataset, _pack_eef20
+from openwam.dataloader.utils.normalization import ROT6D_DIMS_EEF20
 from openwam.dataloader.registry import build_dataset
 from scripts_piper.convert_piper_x import convert_piper_x
 from tests.test_piper_x import _segment
@@ -35,6 +38,34 @@ def test_right_arm_window_uses_piper_bucket(tmp_path):
     evaluation = PiperXDataset(str(test), split="test", normalization_dataset_dir=str(train))
     assert len(evaluation) == 1
     assert evaluation[0]["episode_index"] == 0
+
+
+def test_rotation_6d_uses_official_eef20_slots(tmp_path):
+    train, _test = _buckets(tmp_path)
+    dataset = PiperXDataset(str(train), split="train", action_mode="eef")
+    item = dataset[0]
+    assert int(item["action_mask"][0].sum()) == 20
+    assert bool(item["action_mask"][0, 0:10].all())
+    assert bool(item["action_mask"][0, 34:44].all())
+    table = pq.read_table(train / "data/chunk-000/episode_000000.parquet", columns=["action_eef"])
+    stored = np.asarray(table["action_eef"].to_pylist(), dtype=np.float32)[:32]
+    packed = _pack_eef20(stored)
+    np.testing.assert_allclose(item["action"][:, 3:9].numpy(), packed[:, 3:9], atol=1e-6)
+    np.testing.assert_allclose(item["action"][:, 37:43].numpy(), packed[:, 13:19], atol=1e-6)
+    rot6d = list(ROT6D_DIMS_EEF20)
+    assert np.allclose(dataset._action_stats["min"][rot6d], -1.0)
+    assert np.allclose(dataset._action_stats["max"][rot6d], 1.0)
+    assert dataset.normalization_stats_payload["eef"] is dataset._action_stats
+
+
+def test_unknown_action_mode_is_rejected(tmp_path):
+    train, _test = _buckets(tmp_path)
+    try:
+        PiperXDataset(str(train), split="train", action_mode="joint")
+    except ValueError as exc:
+        assert "action_mode" in str(exc)
+    else:
+        raise AssertionError("Piper X must reject an unknown action_mode")
 
 
 def test_registry_and_test_sibling(tmp_path):

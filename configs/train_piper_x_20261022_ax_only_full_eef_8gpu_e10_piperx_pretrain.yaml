@@ -1,0 +1,12 @@
+# Same 10-epoch Piper X recipe, warm-started from the official RoboDojo Piper-X
+# checkpoint instead of Foundation. The file path selects step 30000.
+defaults:
+  - train_piper_x_20261022_ax_only_full_eef_8gpu_e10
+  - _self_
+
+training:
+  finetune_ckpt_path: /vePFS/data/openwam/OpenWAM-Alpha-Real-RoboDojo-Piper-X/checkpoint_step_30000.safetensors
+  output_path: /vePFS/zhuoyu/OpenWAM/outputs/piper_x_20261022_ax_only_full_eef_8gpu_e10_piperx_pretrain
+
+project:
+  output_dir: /vePFS/zhuoyu/OpenWAM/outputs/piper_x_20261022_ax_only_full_eef_8gpu_e10_piperx_pretrain/hydra

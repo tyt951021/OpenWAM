@@ -41,6 +41,68 @@ def _closed_loop_proprio(action: np.ndarray, state_key: str) -> np.ndarray:
     return proprio
 
 
+def _install_demospeedup_windows(ds, cfg, entropy_dir: str, offset: int, chunk_stride: int) -> dict:
+    """Replace contiguous test windows with one training phase of kept frames.
+
+    The threshold is fit on every episode in this split, matching training.
+    Open-loop chunks then advance by ``chunk_stride`` along that kept sequence,
+    the same non-overlapping step the contiguous evaluation uses on raw frames.
+    """
+    from openwam.dataloader.demospeedup import build_keep_plan
+
+    dataloader = cfg.dataloader
+    num_offsets = OmegaConf.select(dataloader, "demospeedup_num_offsets", default=None)
+    plan = build_keep_plan(
+        ds._episodes,
+        ds._tables,
+        Path(entropy_dir),
+        r_precision=int(dataloader.demospeedup_r_precision),
+        r_casual=int(dataloader.demospeedup_r_casual),
+        num_offsets=None if num_offsets is None else int(num_offsets),
+        gripper_radius=int(dataloader.demospeedup_gripper_radius),
+        gripper_delta=float(dataloader.demospeedup_gripper_delta),
+        smooth_width=int(dataloader.demospeedup_smooth_width),
+        min_frames=ds.num_frames,
+    )
+    if offset < 0 or offset >= int(plan.summary["num_offsets"]):
+        raise ValueError(
+            f"demospeedup offset {offset} is outside [0, {int(plan.summary['num_offsets']) - 1}]"
+        )
+    windows = []
+    for local, phases in enumerate(plan.tables):
+        kept = phases[offset]
+        max_start = len(kept) - ds.num_frames
+        if max_start >= 0:
+            windows.extend((local, start, offset) for start in range(0, max_start + 1, chunk_stride))
+    if not windows:
+        raise ValueError(f"DemoSpeedup offset {offset} produced no {ds.num_frames}-frame windows")
+    ds._kept = plan.tables
+    ds._windows = windows
+    summary = dict(plan.summary)
+    summary["eval_offset"] = int(offset)
+    summary["eval_windows"] = len(windows)
+    summary["entropy_dir"] = str(entropy_dir)
+    print(
+        "[eval] demospeedup "
+        f"offset={offset} r_precision={summary['r_precision']} r_casual={summary['r_casual']} "
+        f"threshold={summary['threshold']:.6f} windows={len(windows)} "
+        f"precision_frames={summary['precision_frames']}/{summary['source_frames']}",
+        flush=True,
+    )
+    return summary
+
+
+def _episode_window_indices(ds, episode: int, chunk_stride: int, limit: int) -> list[int]:
+    chosen = []
+    for index, window in enumerate(ds._windows):
+        if int(window[0]) != episode or int(window[1]) % chunk_stride != 0:
+            continue
+        chosen.append(index)
+        if len(chosen) >= limit:
+            break
+    return chosen
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint-dir", required=True)
@@ -52,8 +114,14 @@ def main() -> None:
     p.add_argument("--denoise-steps", type=int, default=10)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--decode-video", action="store_true")
+    p.add_argument("--prompt", default=None,
+                   help="Replace the episode prompt. Use this when the test bucket wording differs from training.")
     p.add_argument("--closed-loop", action="store_true",
                    help="Feed the previous chunk's last generated frame and last predicted action into the next chunk. Implies --decode-video and requires chunk stride 32.")
+    p.add_argument("--demospeedup-entropy-dir", default=None,
+                   help="Test-split action entropy. Required when the checkpoint was trained with DemoSpeedup. Rates come from the checkpoint.")
+    p.add_argument("--demospeedup-offset", type=int, default=0,
+                   help="Which training phase to roll out. 0 keeps residue 0 inside each precision/casual run.")
     args = p.parse_args()
     if args.closed_loop:
         args.decode_video = True
@@ -84,6 +152,21 @@ def main() -> None:
     ds = LinglongDataset.from_config(dl_cfg, split="test")
     if ds.dataset_dir.resolve() != Path(args.dataset_dir).resolve():
         raise ValueError(f"Unexpected dataset override: {ds.dataset_dir}")
+    trained_demospeedup = bool(OmegaConf.select(cfg, "dataloader.demospeedup_enabled", default=False))
+    if trained_demospeedup and not args.demospeedup_entropy_dir:
+        raise ValueError(
+            "This checkpoint was trained with DemoSpeedup. Pass --demospeedup-entropy-dir "
+            "for the evaluated split so windows use that model's precision/casual rates."
+        )
+    if args.demospeedup_entropy_dir and not trained_demospeedup:
+        raise ValueError("This checkpoint was trained on contiguous frames; do not pass --demospeedup-entropy-dir")
+    if args.demospeedup_entropy_dir and args.closed_loop:
+        raise ValueError("DemoSpeedup frame gathering is implemented for open-loop evaluation")
+    demospeedup_summary = None
+    if args.demospeedup_entropy_dir:
+        demospeedup_summary = _install_demospeedup_windows(
+            ds, cfg, args.demospeedup_entropy_dir, int(args.demospeedup_offset), int(args.chunk_stride)
+        )
     if args.closed_loop and args.chunk_stride != ds.num_frames - 1:
         raise ValueError(
             f"closed-loop requires --chunk-stride {ds.num_frames - 1} "
@@ -102,7 +185,7 @@ def main() -> None:
     valid = ds.raw_action_mask
     print(
         f"[eval] state_key={ds.state_key} action_key={ds.action_key} valid_dims={int(valid.sum())} "
-        f"closed_loop={bool(args.closed_loop)}",
+        f"closed_loop={bool(args.closed_loop)} demospeedup={bool(args.demospeedup_entropy_dir)}",
         flush=True,
     )
 
@@ -110,12 +193,15 @@ def main() -> None:
         raise ValueError(f"episode {args.episode} is outside [0, {len(ds._episodes) - 1}]")
     episode_ids = [args.episode] if args.episode is not None else range(len(ds._episodes))
     for episode in episode_ids:
-        starts = [s for ep, s in ds._windows if ep == episode and s % args.chunk_stride == 0]
-        starts = starts[: int(args.max_windows)]
-        if not starts:
+        window_indices = _episode_window_indices(ds, episode, int(args.chunk_stride), int(args.max_windows))
+        if not window_indices:
             print(f"[eval] episode={episode} has no valid windows; skipping", flush=True)
             continue
-        print(f"[eval] episode={episode:02d} windows={len(starts)}", flush=True)
+        window_frames = [ds._window_frames(index) for index in window_indices]
+        starts = [int(frames[0]) for _, _, frames in window_frames]
+        bucket_prompt = (ds._episodes[episode].get("tasks") or [ds._prompt])[0]
+        prompt = args.prompt if args.prompt is not None else bucket_prompt
+        print(f"[eval] episode={episode:02d} windows={len(starts)} prompt={prompt!r} bucket_prompt={bucket_prompt!r}", flush=True)
         ep_out = out_root / f"episode_{episode:02d}"
         ep_out.mkdir(parents=True, exist_ok=True)
         writers = None
@@ -145,10 +231,11 @@ def main() -> None:
         predictions, targets, latencies = [], [], []
         feedback = None
         generated_label = "Generated (closed loop)" if args.closed_loop else "Generated (recorded first frame)"
-        for i, start in enumerate(starts, 1):
-            item = (episode, start)
-            sample = ds[ds._windows.index(item)]
-            table = ds._read_table(episode).slice(start, ds.num_frames)
+        import pyarrow as pa
+
+        for i, (index, start, source_frames) in enumerate(zip(window_indices, starts, (frames for _, _, frames in window_frames)), 1):
+            sample = ds[index]
+            table = ds._read_table(episode).take(pa.array(np.asarray(source_frames, dtype=np.int64)))
             raw_state = np.asarray(table[ds.state_key][0].as_py(), dtype=np.float32)
             raw_target = np.asarray(table[ds.action_key].to_pylist(), dtype=np.float32)[: ds.num_frames - 1]
             first_image = [feedback["image"]] if feedback is not None else sample["first_frame_image"]
@@ -156,7 +243,7 @@ def main() -> None:
             t0 = time.perf_counter()
             result = engine.generate(
                 {
-                    "prompt": sample["prompt"],
+                    "prompt": prompt,
                     "first_frame_image": first_image,
                     "proprio": proprio,
                     "seed": int(args.seed),
@@ -193,11 +280,17 @@ def main() -> None:
                     panel.paste(gt, (0, 56))
                     panel.paste(frame, (w, 56))
                     draw = ImageDraw.Draw(panel)
-                    raw_frame = start + j * ds.video_stride
+                    raw_frame = int(source_frames[j * ds.video_stride])
                     draw.text((8, 5), "GT (recorded)", fill="white")
                     draw.text((w + 8, 5), generated_label, fill="white")
                     draw.text((8, 23), f"Episode {episode} | chunk {i}/{len(starts)} | start={start} | frame={raw_frame}", fill="white")
-                    mode = "Closed-loop image and action" if args.closed_loop else "Non-overlap chunks"
+                    if demospeedup_summary is None:
+                        mode = "Closed-loop image and action" if args.closed_loop else "Non-overlap chunks"
+                    else:
+                        mode = (
+                            f"DemoSpeedup r={demospeedup_summary['r_precision']}/"
+                            f"{demospeedup_summary['r_casual']} offset={demospeedup_summary['eval_offset']}"
+                        )
                     draw.text((8, 39), f"{mode} | video {video_fps:g} fps | denoise={args.denoise_steps}", fill="white")
                     comparison.append_data(np.asarray(panel))
                     generated.append_data(np.asarray(frame))
@@ -217,6 +310,8 @@ def main() -> None:
                         "checkpoint": str(args.checkpoint_dir),
                         "dataset_dir": str(args.dataset_dir),
                         "episode": episode,
+                        "prompt": prompt,
+                        "bucket_prompt": bucket_prompt,
                         "chunk_stride": args.chunk_stride,
                         "video_fps": video_fps,
                         "raw_fps": raw_fps,
@@ -224,14 +319,18 @@ def main() -> None:
                         "denoise_steps": args.denoise_steps,
                         "dit_cache_enabled": bool(deploy_cfg.optimization.dit_cache.enabled),
                         "closed_loop": bool(args.closed_loop),
+                        "demospeedup": demospeedup_summary,
                         "description": (
                             "The first chunk uses the recorded image and state. Each later chunk uses the previous chunk's last generated frame and last predicted action. That action is one 15 Hz step before the video frame. GT frames stay the recording. Shared boundary frames are removed."
                             if args.closed_loop else
+                            "Each chunk uses its recorded first image and state, not autoregressive rollout. Shared boundary frames are removed. DemoSpeedup chunks gather kept frames with the checkpoint's precision and casual rates."
+                            if demospeedup_summary is not None else
                             "Each chunk uses its recorded first image and state, not autoregressive rollout. Shared boundary frames removed for contiguous chunks."
                         ),
-                        "last_covered_raw_frame": starts[-1] + ds.num_frames - 1,
-                        "omitted_tail_frames": int(ds._episodes[episode]["length"]) - (starts[-1] + ds.num_frames),
+                        "last_covered_raw_frame": int(window_frames[-1][2][-1]),
+                        "omitted_tail_frames": int(ds._episodes[episode]["length"]) - int(window_frames[-1][2][-1]) - 1,
                         "chunks": starts,
+                        "source_frames": [frames.tolist() for _, _, frames in window_frames],
                     },
                     indent=2,
                 )
@@ -243,11 +342,16 @@ def main() -> None:
             "checkpoint_dir": str(args.checkpoint_dir),
             "dataset_dir": str(args.dataset_dir),
             "episode": episode,
+            "prompt": prompt,
+            "bucket_prompt": bucket_prompt,
             "windows": len(starts),
             "denoise_steps": args.denoise_steps,
             "state_key": ds.state_key,
             "action_key": ds.action_key,
             "closed_loop": bool(args.closed_loop),
+            "demospeedup_r_precision": None if demospeedup_summary is None else int(demospeedup_summary["r_precision"]),
+            "demospeedup_r_casual": None if demospeedup_summary is None else int(demospeedup_summary["r_casual"]),
+            "demospeedup_offset": None if demospeedup_summary is None else int(demospeedup_summary["eval_offset"]),
             "mae": float(np.abs(err).mean()),
             "rmse": float(np.sqrt(np.mean(err**2))),
             "max_abs_error": float(np.abs(err).max()),

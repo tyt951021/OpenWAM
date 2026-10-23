@@ -27,7 +27,7 @@ FITTINGS = Path(
     "data/linglong_0923_1010_1012_1017_fittings_eef_gtstate_train_15hz"
 )
 SHEET_ENTROPY = Path(
-    "/vePFS/zhuoyu/OpenWAM/outputs/action_entropy_20261019_20261020_openwam_train_step18185_stride2"
+    "/vePFS/zhuoyu/OpenWAM/outputs/action_entropy_20261019_20261020_openwam_train_step21830_stride2"
 )
 FITTINGS_ENTROPY = Path("/vePFS/zhuoyu/OpenWAM/outputs/action_entropy_fittings_eef_step18185_stride2")
 OUTPUT = Path("/vePFS/zhuoyu/OpenWAM/outputs/action_entropy_allstuff_20261019_20261020_eef_step18185_stride2")
