@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from openwam.dataloader.piper_x import PiperXDataset
-from scripts.eval_piper_x import closed_loop_proprio, episode_starts, require_contiguous
+from scripts_piper.eval_piper_x import closed_loop_proprio, episode_starts, require_contiguous
 from scripts_piper.convert_piper_x import convert_piper_x
 from tests.test_piper_x import _segment
 

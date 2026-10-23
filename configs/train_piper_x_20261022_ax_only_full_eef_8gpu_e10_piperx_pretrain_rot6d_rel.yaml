@@ -1,0 +1,14 @@
+# Official rot6d layout, with each action pose written in the input state's frame.
+# Stored data and the restored 16D command stay absolute.
+defaults:
+  - train_piper_x_20261022_ax_only_full_eef_8gpu_e10_piperx_pretrain_rot6d
+  - _self_
+
+dataloader:
+  relative_to_state: true
+
+training:
+  output_path: /vePFS/zhuoyu/OpenWAM/outputs/piper_x_20261022_ax_only_full_eef_8gpu_e10_piperx_pretrain_rot6d_rel
+
+project:
+  output_dir: /vePFS/zhuoyu/OpenWAM/outputs/piper_x_20261022_ax_only_full_eef_8gpu_e10_piperx_pretrain_rot6d_rel/hydra

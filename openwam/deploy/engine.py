@@ -25,6 +25,27 @@ logger = logging.getLogger(__name__)
 DEFAULT_PROMPT_EMBED_CACHE_MAXSIZE = 32
 
 
+def _restore_relative_piper_command(cfg, raw_proprio, result: dict) -> dict:
+    """Map a relative Piper X prediction back to the stored absolute command."""
+    from omegaconf import OmegaConf
+
+    if not bool(OmegaConf.select(cfg, "dataloader.relative_to_state", default=False)):
+        return result
+    if OmegaConf.select(cfg, "dataloader.type", default=None) != "piper_x":
+        return result
+    if raw_proprio is None:
+        raise ValueError("relative Piper X inference needs the absolute 16D input state")
+    from openwam.dataloader.utils.relative_eef import restore_absolute_command
+
+    restored = dict(result)
+    restored["actions"] = restore_absolute_command(
+        result["actions"],
+        raw_proprio,
+        OmegaConf.select(cfg, "dataloader.action_mode", default="eef_quat"),
+    )
+    return restored
+
+
 class BaseInferenceEngine(ABC):
     """Inference engine base class.
 
@@ -322,10 +343,13 @@ class JointInferenceEngine(BaseInferenceEngine):
             self._dit_cache.reset()
 
         # Deploy proprio: array-like in, normalized model-space tensor out.
+        # Keep the raw state so a relative Piper X command can be composed
+        # back into the absolute EEF the dataset and robot already use.
         proprio = conditions.get("proprio")
         if proprio is None:
             observation = conditions.get("observation") or {}
             proprio = observation.get("state") if isinstance(observation, dict) else None
+        raw_proprio = proprio
         if proprio is not None:
             proprio = self.architecture.normalize_deploy_proprio(proprio)
 
@@ -363,6 +387,7 @@ class JointInferenceEngine(BaseInferenceEngine):
             }
         )
         result = self.architecture.generate(**generate_kwargs)
+        result = _restore_relative_piper_command(self.cfg, raw_proprio, result)
 
         # Attach optimization stats if profiling
         if self._profile and self._dit_cache is not None:

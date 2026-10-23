@@ -12,6 +12,11 @@ Gripper aperture is 0 closed and 1 open. Both arms are supervised.
   converted to rotation 6D, packed as 20D ``xyz + rot6d + gripper`` per arm,
   and scattered to slots ``0-9`` and ``34-43``. Position and gripper use the
   training-bucket statistics. Rotation 6D is left unchanged.
+
+``relative_to_state`` leaves the stored rows and the returned absolute command
+alone. Inside a window, each action pose is rewritten in the frame of the
+input state at the first frame. The gripper command stays absolute. Inference
+applies the inverse before the command leaves the engine.
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ from openwam.dataloader.transforms.multiview import assemble_multiview_layout
 from openwam.dataloader.utils import get_cfg
 from openwam.dataloader.utils.normalization import ROT6D_DIMS_EEF20, apply_normalization, pin_rot6d_identity
 from openwam.dataloader.utils.poses import arms_to_eef20
+from openwam.dataloader.utils.relative_eef import absolute_to_relative
 from openwam.dataloader.utils.unify_action import UNIFY_DIM, map_to_unify, parse_unify_spec
 
 
@@ -66,10 +72,10 @@ def _pack_eef20(values: np.ndarray) -> np.ndarray:
     ).astype(np.float32, copy=False)
 
 
-def _vector_stats(values: np.ndarray) -> dict:
+def _vector_stats(values: np.ndarray, *, pin_rot6d: bool = False) -> dict:
     values = np.asarray(values, dtype=np.float64)
-    if values.ndim != 2 or values.shape[0] < 2 or values.shape[1] != EEF20_DIM:
-        raise ValueError(f"rotation-6D statistics need at least two 20D rows, got {values.shape}")
+    if values.ndim != 2 or values.shape[0] < 2:
+        raise ValueError(f"EEF statistics need at least two rows, got {values.shape}")
     stats = {
         "mean": values.mean(0).astype(np.float32),
         "std": values.std(0, ddof=1).astype(np.float32),
@@ -78,9 +84,12 @@ def _vector_stats(values: np.ndarray) -> dict:
         "q01": np.quantile(values, 0.01, axis=0).astype(np.float32),
         "q99": np.quantile(values, 0.99, axis=0).astype(np.float32),
     }
-    pin_rot6d_identity(stats, ROT6D_DIMS_EEF20)
+    if pin_rot6d:
+        if values.shape[1] != EEF20_DIM:
+            raise ValueError(f"rotation-6D statistics need 20D rows, got {values.shape}")
+        pin_rot6d_identity(stats, ROT6D_DIMS_EEF20)
     if any(not np.isfinite(item).all() for item in stats.values()):
-        raise ValueError("rotation-6D statistics contain a non-finite value")
+        raise ValueError("EEF statistics contain a non-finite value")
     return stats
 
 
@@ -102,7 +111,40 @@ def _eef20_stats(bucket: str) -> tuple[dict, dict]:
         action_rows.append(np.asarray(table[ACTION_COLUMN].to_pylist(), dtype=np.float32))
     state = _pack_eef20(np.concatenate(state_rows, axis=0))
     action = _pack_eef20(np.concatenate(action_rows, axis=0))
-    return _vector_stats(action), _vector_stats(state)
+    return _vector_stats(action, pin_rot6d=True), _vector_stats(state, pin_rot6d=True)
+
+
+@lru_cache(maxsize=8)
+def _relative_action_stats(bucket: str, action_mode: str, window_stride: int) -> dict:
+    """Action statistics after expressing every training window in its initial state."""
+    root = Path(bucket)
+    episodes = [
+        json.loads(line)
+        for line in (root / "meta" / "episodes.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    horizon = NUM_FRAMES - 1
+    rows = []
+    for index in range(len(episodes)):
+        path = root / "data" / f"chunk-{index // 1000:03d}" / f"episode_{index:06d}.parquet"
+        table = pq.read_table(path, columns=[STATE_COLUMN, ACTION_COLUMN])
+        state = np.asarray(table[STATE_COLUMN].to_pylist(), dtype=np.float32)
+        action = np.asarray(table[ACTION_COLUMN].to_pylist(), dtype=np.float32)
+        starts = np.arange(0, state.shape[0] - NUM_FRAMES + 1, int(window_stride), dtype=np.int64)
+        if starts.size == 0:
+            continue
+        time = starts[:, None] + np.arange(horizon, dtype=np.int64)[None, :]
+        relative = absolute_to_relative(action[time], state[starts]).reshape(-1, EEF_DIM)
+        rows.append(relative)
+    if not rows:
+        raise ValueError(f"{bucket} has no windows for relative EEF statistics")
+    values = np.concatenate(rows, axis=0)
+    if action_mode == "eef":
+        values = _pack_eef20(values)
+        return _vector_stats(values, pin_rot6d=True)
+    if action_mode != "eef_quat":
+        raise ValueError(f"unsupported relative action_mode {action_mode!r}")
+    return _vector_stats(values)
 
 
 class PiperXDataset(BaseDataset):
@@ -140,6 +182,7 @@ class PiperXDataset(BaseDataset):
             unify_action_map=get_cfg(config, "unify_action_map", UNIFY_MAP),
             unify_state_map=get_cfg(config, "unify_state_map", None),
             action_mode=get_cfg(config, "action_mode", "eef_quat"),
+            relative_to_state=bool(get_cfg(config, "relative_to_state", False)),
             normalization_dataset_dir=normalization_dataset_dir,
             active_raw_action_dims=get_cfg(config, "active_raw_action_dims", None),
             active_raw_state_dims=get_cfg(config, "active_raw_state_dims", None),
@@ -165,6 +208,7 @@ class PiperXDataset(BaseDataset):
         unify_action_map=None,
         unify_state_map=None,
         action_mode: str = "eef_quat",
+        relative_to_state: bool = False,
         normalization_dataset_dir=None,
         active_raw_action_dims=None,
         active_raw_state_dims=None,
@@ -177,6 +221,7 @@ class PiperXDataset(BaseDataset):
                 f"Piper X action_mode must be one of {sorted(ACTION_MODES)}, got {self.action_mode!r}"
             )
         self.raw_dim, default_unify_map = ACTION_MODES[self.action_mode]
+        self.relative_to_state = bool(relative_to_state)
         self.state_key = STATE_COLUMN
         self.action_key = ACTION_COLUMN
         self.num_frames = int(num_frames)
@@ -279,10 +324,14 @@ class PiperXDataset(BaseDataset):
         elif manifest.get("split") != "train":
             raise ValueError("Piper X training statistics require a train bucket")
         if self.action_mode == "eef":
-            self._action_stats, self._state_stats = _eef20_stats(str(stats_dir))
+            absolute_action_stats, self._state_stats = _eef20_stats(str(stats_dir))
         else:
-            self._action_stats = self._load_stats(stats_dir / "meta" / "action_eef_stats.json", ACTION_COLUMN, "action")
+            absolute_action_stats = self._load_stats(stats_dir / "meta" / "action_eef_stats.json", ACTION_COLUMN, "action")
             self._state_stats = self._load_stats(stats_dir / "meta" / "state_eef_stats.json", STATE_COLUMN, "state")
+        if self.relative_to_state:
+            self._action_stats = _relative_action_stats(str(stats_dir), self.action_mode, self.window_stride)
+        else:
+            self._action_stats = absolute_action_stats
         self.normalization_stats_payload = {
             self.action_mode: self._action_stats,
             f"{self.action_mode}_state": self._state_stats,
@@ -376,6 +425,12 @@ class PiperXDataset(BaseDataset):
                 norms = np.linalg.norm(values[:, quat_start:quat_start + 4], axis=-1)
                 if not np.allclose(norms, 1.0, atol=1e-3):
                     raise ValueError(f"Piper X {label} quaternions must be unit wxyz")
+        if self.relative_to_state:
+            horizon = self.num_frames - 1
+            action = np.concatenate(
+                (absolute_to_relative(action[:horizon], state[0]), action[horizon:]),
+                axis=0,
+            )
         if self.action_mode == "eef":
             state = _pack_eef20(state)
             action = _pack_eef20(action)

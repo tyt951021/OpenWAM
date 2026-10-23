@@ -1,0 +1,14 @@
+# Same official-Piper-X 10-epoch quaternion run, with actions expressed relative
+# to the window's input state. Stored data and the restored command stay absolute.
+defaults:
+  - train_piper_x_20261022_ax_only_full_eef_8gpu_e10_piperx_pretrain
+  - _self_
+
+dataloader:
+  relative_to_state: true
+
+training:
+  output_path: /vePFS/zhuoyu/OpenWAM/outputs/piper_x_20261022_ax_only_full_eef_8gpu_e10_piperx_pretrain_rel
+
+project:
+  output_dir: /vePFS/zhuoyu/OpenWAM/outputs/piper_x_20261022_ax_only_full_eef_8gpu_e10_piperx_pretrain_rel/hydra

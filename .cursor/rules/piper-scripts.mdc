@@ -1,0 +1,8 @@
+---
+description: Piper X 脚本放在 scripts_piper
+alwaysApply: true
+---
+
+# Piper 脚本位置
+
+Piper X 的启动、转换、评测和熵估计脚本放在 `scripts_piper/`。通用入口 `scripts/train.py` 和 `scripts/run_linglong_action_entropy.py` 留在 `scripts/`，由 `scripts_piper` 里的启动脚本调用。
